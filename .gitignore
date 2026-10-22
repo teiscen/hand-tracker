@@ -1,4 +1,8 @@
 handenv/
+.venv/
 OldParsers/
 _hand.py
 output.txt
+__pycache__/
+*.egg-info/
+runs/

@@ -1,0 +1,1494 @@
+diff --git a/README.md b/README.md
+index 25adb42..d408ab7 100644
+--- a/README.md
++++ b/README.md
+@@ -42,8 +42,13 @@ The pipeline diagram is in `Extraneous/Pipeline.png`.
+ | Path | What it is |
+ |------|------------|
+ | `hand_tracker/app.py` | Webcam loop and the `hand-tracker` command |
+-| `hand_tracker/landmarker.py` | MediaPipe wrappers (live stream and single image) |
+-| `hand_tracker/parser_model.py` | Feature extraction and smoothing |
++| `hand_tracker/camera.py` | Webcam wrapper |
++| `hand_tracker/landmarker.py` | MediaPipe wrapper (live stream or single image) |
++| `hand_tracker/overlay.py` | Draws the landmarks on the video |
++| `hand_tracker/features.py` | Landmarks to joint angles, extension, spread and thumb opposition |
++| `hand_tracker/smoothing.py` | Savitzky-Golay smoothing over a short clip |
++| `hand_tracker/capture.py` | Records 4 frames and writes the `output.txt` report |
++| `hand_tracker/report.py` | Text formatting for the report |
+ | `hand_tracker/models/` | The MediaPipe `hand_landmarker.task` model |
+ | `hand_tracker/ros/` | Optional ROS 2 publisher and the robot hand URDF |
+ | `hand_tracker/ml/` | Optional autoencoder experiment |
+diff --git a/hand_tracker/app.py b/hand_tracker/app.py
+index b6372d7..b7bf120 100644
+--- a/hand_tracker/app.py
++++ b/hand_tracker/app.py
+@@ -1,150 +1,39 @@
++"""Webcam loop and the `hand-tracker` command."""
+ import argparse
+ 
+-import mediapipe as mp
+ import cv2 as cv
++
++from .camera import WebcamManager
++from .capture import FrameRecorder, generate_labelled_data
+ from .landmarker import HandLandmarkerManagerLive
+-from .parser_model import generate_labelled_data
+-
+-class Transforms:
+-    def apply_transforms(bgr_frame, hand_manager):
+-        rgb_frame = cv.cvtColor(bgr_frame, cv.COLOR_BGR2RGB)
+-
+-        rgb_frame = Transforms.draw_flipped(rgb_frame)
+-        rgb_frame = Transforms.draw_landmarks(rgb_frame, hand_manager)
+-
+-        bgr_frame = cv.cvtColor(rgb_frame, cv.COLOR_RGB2BGR)       
+-        return bgr_frame   
+-
+-    def draw_landmarks(rgb_frame, hand_manager):
+-        """Draw hand landmarks and connections on the image."""
+-
+-        hand_manager.detect_async(rgb_frame)
+-        detection_result = hand_manager.get_latest_result() 
+-
+-        if not detection_result or not detection_result.hand_landmarks:
+-            return rgb_frame
+-            
+-        for hand_landmarks in detection_result.hand_landmarks:
+-            # Convert normalized coordinates to pixel coordinates
+-            height, width, _ = rgb_frame.shape
+-            landmark_points = []
+-            
+-            for landmark in hand_landmarks:
+-                x = int(landmark.x * width) 
+-                y = int(landmark.y * height)
+-                landmark_points.append((x, y))
+-            
+-            # Draw connections
+-            # Hand landmark drawing specifications
+-            HAND_CONNECTIONS = mp.solutions.hands.HAND_CONNECTIONS
+-            for connection in HAND_CONNECTIONS:
+-                start_point = landmark_points[connection[0]]
+-                end_point = landmark_points[connection[1]]
+-                cv.line(rgb_frame, start_point, end_point, (0, 255, 0), 2)
+-            
+-            # Draw landmarks with labels
+-            for idx, (x, y) in enumerate(landmark_points):
+-                cv.circle(rgb_frame, (x, y), 5, (0, 0, 255), -1)
+-                cv.putText(rgb_frame, str(idx), (x + 5, y - 5), 
+-                        cv.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
+-        
+-        return rgb_frame
+-
+-    def draw_flipped(rgb_frame):
+-        # Flip frame horizontally for mirror effect
+-        return cv.flip(rgb_frame, 1)
+-
+-class WebcamManager:
+-    """Context manager for webcam operations with automatic resource management."""
+-    
+-    def __init__(self, camera_id=0, width=640, height=480, fps=30):
+-        self.camera_id = camera_id
+-        self.width = width
+-        self.height = height
+-        self.fps = fps
+-        self.cap = None
+-        self.is_opened = False
+-    
+-    def __enter__(self):
+-        """Initialize webcam when entering context."""
+-        print("Initializing webcam...")
+-        self.cap = cv.VideoCapture(self.camera_id)
+-        
+-        if not self.cap.isOpened():
+-            raise RuntimeError("Error: Could not open webcam.")
+-        
+-        # Set camera properties for better performance
+-        self.cap.set(cv.CAP_PROP_FRAME_WIDTH, self.width)
+-        self.cap.set(cv.CAP_PROP_FRAME_HEIGHT, self.height)
+-        self.cap.set(cv.CAP_PROP_FPS, self.fps)
+-        
+-        self.is_opened = True
+-        print(f"Webcam initialized: {self.width}x{self.height} @ {self.fps}fps")
+-        return self
+-    
+-    def __exit__(self, exc_type, exc_val, exc_tb):
+-        """Clean up webcam when exiting context."""
+-        print("Cleaning up webcam resources...")
+-        if self.cap and self.is_opened:
+-            self.cap.release()
+-        cv.destroyAllWindows()
+-        self.is_opened = False
+-        print("Webcam cleanup completed.")
+-        
+-        # Handle exceptions gracefully
+-        if exc_type:
+-            print(f"Exception occurred: {exc_type.__name__}: {exc_val}")
+-        return False  # Don't suppress exceptions
+-    
+-    def read_frame(self):
+-        """Read a frame from the webcam."""
+-        if not self.is_opened or not self.cap:
+-            raise RuntimeError("Webcam not initialized. Use within 'with' statement.")
+-        
+-        ret, frame = self.cap.read()
+-        if not ret:
+-            raise RuntimeError("Failed to capture frame from webcam.")
+-        
+-        return frame
+-    
+-    def is_camera_opened(self):
+-        """Check if camera is properly opened."""
+-        return self.is_opened and self.cap and self.cap.isOpened()
+-
+-tracking = -1
+-frame_list = []
+-def webcam_loop(webcam_manager, hand_manager):
+-    """Process a single frame from the webcam."""
+-    global tracking, frame_list
++from .overlay import apply_transforms
++
++
++def process_frame(webcam, hand_manager, recorder):
++    """Show one webcam frame with landmarks and handle key presses.
+ 
++    Returns False when the loop should stop.
++    """
+     try:
+-        bgr_frame = webcam_manager.read_frame()
++        bgr_frame = webcam.read_frame()
+     except RuntimeError as e:
+         print(f"Error: {e}")
+-        return False  # Signal to stop the loop
++        return False
+ 
+-    # Display the frame
+-    updated_bgr_frame = Transforms.apply_transforms(bgr_frame, hand_manager)
+-    cv.imshow('Hand Landmark Detection', updated_bgr_frame)    
++    cv.imshow('Hand Landmark Detection', apply_transforms(bgr_frame, hand_manager))
+ 
+-    # Break loop on 'q' key press
+     key = cv.waitKey(1) & 0xFF
+     if key == ord('q'):
+-        return False  # Signal to stop the loop
++        return False
+     if key == ord('r'):
+-        if tracking == -1:
+-            tracking = 0
++        recorder.start()
+ 
+-    if tracking > -1 and tracking < 5: 
+-        frame_list.append(bgr_frame.copy())  # Copy the frame to avoid reference issues
+-        tracking += 1
++    frames = recorder.feed(bgr_frame)
++    if frames is not None:
++        generate_labelled_data(frames)
+ 
+-        if tracking == 4:
+-            generate_labelled_data(frame_list[:])  # Pass a copy of the list
+-            frame_list.clear()
+-            tracking = -1
++    return True
+ 
+-    return True  # Continue the loop
+ 
+ def main(argv=None):
+     """Entry point for the `hand-tracker` command."""
+@@ -163,19 +52,21 @@ def main(argv=None):
+                            height=args.height, fps=args.fps) as webcam:
+             with HandLandmarkerManagerLive() as hand_manager:
+                 print("Starting webcam feed. Press 'q' to quit.")
++                recorder = FrameRecorder()
+ 
+                 while webcam.is_camera_opened():
+-                    if not webcam_loop(webcam, hand_manager):
++                    if not process_frame(webcam, hand_manager, recorder):
+                         break
+-                    
++
+     except RuntimeError as e:
+         print(f"Webcam error: {e}")
+     except KeyboardInterrupt:
+         print("\nInterrupted by user")
+     except Exception as e:
+         print(f"Unexpected error: {e}")
+-    
++
+     print("Application stopped.")
+ 
++
+ if __name__ == "__main__":
+-    main()
+\ No newline at end of file
++    main()
+diff --git a/hand_tracker/camera.py b/hand_tracker/camera.py
+new file mode 100644
+index 0000000..fea8a16
+--- /dev/null
++++ b/hand_tracker/camera.py
+@@ -0,0 +1,59 @@
++"""Webcam access with automatic cleanup."""
++import cv2 as cv
++
++
++class WebcamManager:
++    """Context manager for webcam operations with automatic resource management."""
++
++    def __init__(self, camera_id=0, width=640, height=480, fps=30):
++        self.camera_id = camera_id
++        self.width = width
++        self.height = height
++        self.fps = fps
++        self.cap = None
++        self.is_opened = False
++
++    def __enter__(self):
++        """Open the webcam when entering the context."""
++        print("Initializing webcam...")
++        self.cap = cv.VideoCapture(self.camera_id)
++
++        if not self.cap.isOpened():
++            raise RuntimeError("Error: Could not open webcam.")
++
++        # Set camera properties for better performance
++        self.cap.set(cv.CAP_PROP_FRAME_WIDTH, self.width)
++        self.cap.set(cv.CAP_PROP_FRAME_HEIGHT, self.height)
++        self.cap.set(cv.CAP_PROP_FPS, self.fps)
++
++        self.is_opened = True
++        print(f"Webcam initialized: {self.width}x{self.height} @ {self.fps}fps")
++        return self
++
++    def __exit__(self, exc_type, exc_val, exc_tb):
++        """Release the webcam when leaving the context."""
++        print("Cleaning up webcam resources...")
++        if self.cap and self.is_opened:
++            self.cap.release()
++        cv.destroyAllWindows()
++        self.is_opened = False
++        print("Webcam cleanup completed.")
++
++        if exc_type:
++            print(f"Exception occurred: {exc_type.__name__}: {exc_val}")
++        return False  # Don't suppress exceptions
++
++    def read_frame(self):
++        """Read a BGR frame from the webcam."""
++        if not self.is_opened or not self.cap:
++            raise RuntimeError("Webcam not initialized. Use within 'with' statement.")
++
++        ret, frame = self.cap.read()
++        if not ret:
++            raise RuntimeError("Failed to capture frame from webcam.")
++
++        return frame
++
++    def is_camera_opened(self):
++        """Check if camera is properly opened."""
++        return self.is_opened and self.cap and self.cap.isOpened()
+diff --git a/hand_tracker/capture.py b/hand_tracker/capture.py
+new file mode 100644
+index 0000000..751ef51
+--- /dev/null
++++ b/hand_tracker/capture.py
+@@ -0,0 +1,87 @@
++"""Record a short burst of frames and turn it into smoothed feature data."""
++from contextlib import redirect_stdout
++
++import cv2 as cv
++
++from .features import create_example_data
++from .landmarker import HandLandmarkerManagerImage
++from .report import print_example_data, print_labelled_data
++from .smoothing import create_labelled_example
++
++
++class FrameRecorder:
++    """Collects n consecutive frames after start() and hands them back when full."""
++
++    def __init__(self, n_frames=4):
++        self.n_frames = n_frames
++        self.frames = []
++        self.active = False
++
++    def start(self):
++        """Begin recording. Ignored if a recording is already in progress."""
++        if not self.active:
++            self.frames = []
++            self.active = True
++
++    def feed(self, bgr_frame):
++        """Add a frame while recording. Returns the list of frames once it is full, else None."""
++        if not self.active:
++            return None
++
++        self.frames.append(bgr_frame.copy())  # copy so later frame reuse can't change it
++        if len(self.frames) < self.n_frames:
++            return None
++
++        frames, self.frames, self.active = self.frames, [], False
++        return frames
++
++
++def generate_labelled_data(bgr_frame_list, report_path="output.txt"):
++    """Detect hands in each frame, extract right-hand features, smooth them over the clip.
++
++    A text report goes to report_path; the smoothed data is also returned
++    (None if no right hand was found in any frame).
++    """
++    detections = []
++    example_list = []
++    labelled_data = None
++
++    with open(report_path, 'w') as report:
++        with redirect_stdout(report):
++            try:
++                with HandLandmarkerManagerImage() as image_hand_manager:
++                    print(f"Processing {len(bgr_frame_list)} frames...")
++
++                    for i, bgr_frame in enumerate(bgr_frame_list):
++                        print(f"Processing frame {i+1}/{len(bgr_frame_list)}")
++                        try:
++                            rgb_frame = cv.cvtColor(bgr_frame, cv.COLOR_BGR2RGB)
++                            detections.append(image_hand_manager.detect(rgb_frame))
++                        except Exception as e:
++                            print(f"Error processing frame {i+1}: {e}")
++                            detections.append(None)
++
++                    for i, detection_result in enumerate(detections):
++                        print(f"Extracting features from frame {i+1}")
++                        if detection_result is None:
++                            print(f"Frame {i+1} processing failed")
++                            continue
++                        example = create_example_data(detection_result)
++                        if example is None:
++                            print(f"No right hand detected in frame {i+1}")
++                            continue
++                        print_example_data(example)
++                        example_list.append(example)
++
++                    if example_list:
++                        print(f"\nCreating labelled data from {len(example_list)} valid frames...")
++                        labelled_data = create_labelled_example(example_list)
++                        print_labelled_data(labelled_data)
++                    else:
++                        print("No valid hand data found in any frames")
++
++            except Exception as e:
++                print(f"Error in generate_labelled_data: {e}")
++
++    print(f"Labelled data generation complete. Check {report_path} for details.")
++    return labelled_data
+diff --git a/hand_tracker/features.py b/hand_tracker/features.py
+new file mode 100644
+index 0000000..47ec7a4
+--- /dev/null
++++ b/hand_tracker/features.py
+@@ -0,0 +1,98 @@
++"""Turn MediaPipe hand landmarks into the features used to drive a robotic hand."""
++import math
++
++import numpy as np
++
++FINGERS = ("thumb", "index", "middle", "ring", "pinky")
++
++# Landmark index triplets (a, joint, b): the angle is measured at the middle landmark.
++# Each finger has two measured joints.
++JOINT_TRIPLETS = {
++    "thumb":  ((1, 2, 3),    (2, 3, 4)),
++    "index":  ((5, 6, 7),    (6, 7, 8)),
++    "middle": ((9, 10, 11),  (10, 11, 12)),
++    "ring":   ((13, 14, 15), (14, 15, 16)),
++    "pinky":  ((17, 18, 19), (18, 19, 20)),
++}
++
++FINGERTIPS = {"thumb": 4, "index": 8, "middle": 12, "ring": 16, "pinky": 20}
++
++# Adjacent finger pairs whose spread angle is measured.
++SPREAD_PAIRS = (("index", "middle"), ("middle", "ring"), ("ring", "pinky"))
++SPREAD_NAMES = tuple(f"{a}_{b}" for a, b in SPREAD_PAIRS)
++
++
++def vector_angle(v1, v2):
++    """Angle in degrees between two vectors."""
++    cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
++    return np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
++
++
++# Joint Angles
++def calculate_joint_angle(p1, p2, p3):
++    """Angle at joint p2 between points p1-p2-p3."""
++    v1 = np.array([p1.x - p2.x, p1.y - p2.y, p1.z - p2.z])
++    v2 = np.array([p3.x - p2.x, p3.y - p2.y, p3.z - p2.z])
++    return vector_angle(v1, v2)
++
++
++def calculate_joint_angles(hand_landmarks):
++    """Two joint angles per finger, e.g. {'index_angles': [mcp_pip_dip, pip_dip_tip]}."""
++    return {
++        f"{finger}_angles": [
++            calculate_joint_angle(*(hand_landmarks[i] for i in triplet))
++            for triplet in triplets
++        ]
++        for finger, triplets in JOINT_TRIPLETS.items()
++    }
++
++
++# Finger Extension
++def calculate_finger_extension(hand_landmarks):
++    """Distance from the wrist to each fingertip (in image-normalized x/y)."""
++    wrist = hand_landmarks[0]
++    extensions = {}
++    for finger, tip_idx in FINGERTIPS.items():
++        tip = hand_landmarks[tip_idx]
++        extensions[finger] = math.sqrt((tip.x - wrist.x) ** 2 + (tip.y - wrist.y) ** 2)
++    return extensions
++
++
++# Finger Spread
++def calculate_finger_spread(hand_landmarks):
++    """Angle between the wrist-to-fingertip directions of adjacent fingers."""
++    wrist = hand_landmarks[0]
++    vectors = {}
++    for finger in ("index", "middle", "ring", "pinky"):
++        tip = hand_landmarks[FINGERTIPS[finger]]
++        vectors[finger] = np.array([tip.x - wrist.x, tip.y - wrist.y])
++    return {f"{a}_{b}": vector_angle(vectors[a], vectors[b]) for a, b in SPREAD_PAIRS}
++
++
++# Thumb Opposition
++def calculate_thumb_opposition(hand_landmarks):
++    """Distance between the thumb tip and the index fingertip."""
++    thumb_tip = hand_landmarks[4]
++    index_tip = hand_landmarks[8]
++    return math.sqrt((thumb_tip.x - index_tip.x) ** 2 + (thumb_tip.y - index_tip.y) ** 2)
++
++
++def create_example_data(detection_result):
++    """Extract features from a detection result for the right hand only."""
++    if not detection_result or not detection_result.hand_landmarks:
++        return None
++
++    for i, hand_landmarks in enumerate(detection_result.hand_landmarks):
++        try:
++            if detection_result.handedness[i][0].category_name == "Right":
++                return {
++                    'joint_angles':      calculate_joint_angles(hand_landmarks),
++                    'finger_extensions': calculate_finger_extension(hand_landmarks),
++                    'finger_spread':     calculate_finger_spread(hand_landmarks),
++                    'thumb_opposition':  calculate_thumb_opposition(hand_landmarks),
++                }
++        except Exception as e:
++            print(f"Error processing hand {i}: {e}")
++            continue
++
++    return None  # No right hand found
+diff --git a/hand_tracker/landmarker.py b/hand_tracker/landmarker.py
+index 0881236..7be42eb 100644
+--- a/hand_tracker/landmarker.py
++++ b/hand_tracker/landmarker.py
+@@ -1,3 +1,4 @@
++"""MediaPipe hand landmarker wrapper: live-stream mode or single-image mode."""
+ import time
+ from pathlib import Path
+ 
+@@ -13,208 +14,161 @@ HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+ HandLandmarkerResult = mp.tasks.vision.HandLandmarkerResult
+ VisionRunningMode = mp.tasks.vision.RunningMode
+ 
+-class HandLandmarkerManagerLive:
+-    """RAII context manager for MediaPipe hand landmark detection."""
+-    
+-    def __init__(self, 
++LIVE = "live"
++IMAGE = "image"
++
++
++class HandLandmarkerManager:
++    """Context manager around a MediaPipe HandLandmarker.
++
++    mode="live":  frames go in with detect_async(); read the newest result with
++                  get_latest_result().
++    mode="image": call detect(); the result is returned directly (batch processing).
++    """
++
++    def __init__(self,
++                 mode=LIVE,
+                  model_path=DEFAULT_MODEL_PATH,
+                  num_hands=2,
+                  min_detection_confidence=0.5,
+                  min_presence_confidence=0.5,
+                  min_tracking_confidence=0.5):
+-        """Initialize hand landmarker configuration."""
++        if mode not in (LIVE, IMAGE):
++            raise ValueError(f"mode must be '{LIVE}' or '{IMAGE}', got {mode!r}")
++        self.mode = mode
+         self.model_path = str(model_path)
+         self.num_hands = num_hands
+         self.min_detection_confidence = min_detection_confidence
+         self.min_presence_confidence = min_presence_confidence
+         self.min_tracking_confidence = min_tracking_confidence
+-        
+-        # Will be set in __enter__
++
++        # Set in __enter__
+         self.landmarker = None
+         self.latest_result = None
+         self.is_initialized = False
+-    
++
+     def __enter__(self):
+-        """Initialize MediaPipe hand landmarker when entering context."""
+-        print("Initializing MediaPipe hand landmarker...")
+-        
++        """Create the MediaPipe landmarker when entering the context."""
++        print(f"Initializing MediaPipe hand landmarker ({self.mode} mode)...")
++
+         try:
+-            # Create hand landmarker options
+-            options = HandLandmarkerOptions(
++            common = dict(
+                 base_options=BaseOptions(model_asset_path=self.model_path),
+-                running_mode=VisionRunningMode.LIVE_STREAM,
+-                # running_mode=VisionRunningMode.IMAGE,
+-                result_callback=self._result_callback,
+                 num_hands=self.num_hands,
+                 min_hand_detection_confidence=self.min_detection_confidence,
+                 min_hand_presence_confidence=self.min_presence_confidence,
+-                min_tracking_confidence=self.min_tracking_confidence
++                min_tracking_confidence=self.min_tracking_confidence,
+             )
+-            
+-            # Create the landmarker
++            if self.mode == LIVE:
++                options = HandLandmarkerOptions(
++                    running_mode=VisionRunningMode.LIVE_STREAM,
++                    result_callback=self._result_callback,
++                    **common)
++            else:
++                options = HandLandmarkerOptions(
++                    running_mode=VisionRunningMode.IMAGE, **common)
++
+             self.landmarker = HandLandmarker.create_from_options(options)
+             self.is_initialized = True
+-            
+-            print(f"Hand landmarker initialized successfully:")
++
++            print("Hand landmarker initialized successfully:")
+             print(f"  - Model: {self.model_path}")
+             print(f"  - Max hands: {self.num_hands}")
+             print(f"  - Detection confidence: {self.min_detection_confidence}")
+-            
++
+             return self
+-            
++
+         except Exception as e:
+             print(f"Failed to initialize hand landmarker: {e}")
+             raise RuntimeError(f"Hand landmarker initialization failed: {e}")
+-    
++
+     def __exit__(self, exc_type, exc_val, exc_tb):
+-        """Clean up MediaPipe resources when exiting context."""
++        """Release MediaPipe resources when leaving the context."""
+         print("Cleaning up hand landmarker resources...")
+-        
++
+         if self.landmarker and self.is_initialized:
+             try:
+                 self.landmarker.close()
+                 print("Hand landmarker closed successfully.")
+             except Exception as e:
+                 print(f"Error closing hand landmarker: {e}")
+-        
++
+         self.landmarker = None
+         self.latest_result = None
+         self.is_initialized = False
+-        
+-        # Handle exceptions gracefully
++
+         if exc_type:
+             print(f"Exception occurred in hand landmarker: {exc_type.__name__}: {exc_val}")
+-        
++
+         return False  # Don't suppress exceptions
+-    
++
+     def _result_callback(self, result, image, timestamp_ms: int):
+-        """Internal callback for MediaPipe detection results."""
++        """Called by MediaPipe (live mode) whenever a detection finishes."""
+         self.latest_result = result
+-    
+-    def detect_async(self, rgb_frame):
+-        """Detect hands asynchronously in the given RGB frame."""
++
++    def _require_ready(self, mode):
+         if not self.is_initialized or not self.landmarker:
+             raise RuntimeError("Hand landmarker not initialized. Use within 'with' statement.")
+-        
++        if self.mode != mode:
++            method = "detect_async()" if mode == LIVE else "detect()"
++            raise RuntimeError(f"{method} needs a landmarker created with mode='{mode}'.")
++
++    def detect_async(self, rgb_frame):
++        """Live mode: submit an RGB frame; the result arrives via get_latest_result()."""
++        self._require_ready(LIVE)
++
+         try:
+-            # Convert frame to MediaPipe format
+             mp_image = mp.Image(mp.ImageFormat.SRGB, rgb_frame)
+             timestamp = int(time.time() * 1000)
+-            
+-            # Perform async detection
+             self.landmarker.detect_async(mp_image, timestamp)
+-            
++
+         except Exception as e:
+             print(f"Error during hand detection: {e}")
+             raise
+-    
++
++    def detect(self, rgb_frame):
++        """Image mode: detect hands in an RGB frame and return the result."""
++        self._require_ready(IMAGE)
++
++        try:
++            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
++            self.latest_result = self.landmarker.detect(mp_image)
++            return self.latest_result
++
++        except Exception as e:
++            print(f"Error during IMAGE mode hand detection: {e}")
++            raise
++
+     def get_latest_result(self):
+-        """Get the latest detection result."""
++        """Get the most recent detection result."""
+         return self.latest_result
+-    
++
+     def has_hands(self):
+         """Check if hands were detected in the latest result."""
+-        return (self.latest_result is not None and 
+-                self.latest_result.hand_landmarks is not None and 
++        return (self.latest_result is not None and
++                self.latest_result.hand_landmarks is not None and
+                 len(self.latest_result.hand_landmarks) > 0)
+-    
++
+     def get_hand_count(self):
+         """Get the number of detected hands."""
+         if not self.has_hands():
+             return 0
+         return len(self.latest_result.hand_landmarks)
+-    
++
+     def is_ready(self):
+         """Check if the landmarker is ready for detection."""
+         return self.is_initialized and self.landmarker is not None
+ 
+-class HandLandmarkerManagerImage:
+-    """RAII context manager for MediaPipe hand detection in IMAGE mode (batch processing)."""
+-    
+-    def __init__(self, 
+-                 model_path=DEFAULT_MODEL_PATH,
+-                 num_hands=2,
+-                 min_detection_confidence=0.5,
+-                 min_presence_confidence=0.5,
+-                 min_tracking_confidence=0.5):
+-        """Initialize hand landmarker configuration for IMAGE mode."""
+-        self.model_path = str(model_path)
+-        self.num_hands = num_hands
+-        self.min_detection_confidence = min_detection_confidence
+-        self.min_presence_confidence = min_presence_confidence
+-        self.min_tracking_confidence = min_tracking_confidence
+-        
+-        # Will be set in __enter__
+-        self.landmarker = None
+-        self.is_initialized = False
+-    
+-    def __enter__(self):
+-        """Initialize MediaPipe hand landmarker for IMAGE mode."""
+-        print("Initializing MediaPipe hand landmarker (IMAGE mode)...")
+-        
+-        try:
+-            # Create hand landmarker options for IMAGE mode
+-            options = HandLandmarkerOptions(
+-                base_options=BaseOptions(model_asset_path=self.model_path),
+-                running_mode=VisionRunningMode.IMAGE,  # IMAGE mode - no callback needed
+-                num_hands=self.num_hands,
+-                min_hand_detection_confidence=self.min_detection_confidence,
+-                min_hand_presence_confidence=self.min_presence_confidence,
+-                min_tracking_confidence=self.min_tracking_confidence
+-            )
+-            
+-            # Create the landmarker
+-            self.landmarker = HandLandmarker.create_from_options(options)
+-            self.is_initialized = True
+-            
+-            print(f"IMAGE mode hand landmarker initialized successfully:")
+-            print(f"  - Model: {self.model_path}")
+-            print(f"  - Max hands: {self.num_hands}")
+-            print(f"  - Detection confidence: {self.min_detection_confidence}")
+-            
+-            return self
+-            
+-        except Exception as e:
+-            print(f"Failed to initialize IMAGE mode hand landmarker: {e}")
+-            raise RuntimeError(f"Hand landmarker initialization failed: {e}")
+-    
+-    def __exit__(self, exc_type, exc_val, exc_tb):
+-        """Clean up MediaPipe resources when exiting context."""
+-        print("Cleaning up IMAGE mode hand landmarker resources...")
+-        
+-        if self.landmarker and self.is_initialized:
+-            try:
+-                self.landmarker.close()
+-                print("IMAGE mode hand landmarker closed successfully.")
+-            except Exception as e:
+-                print(f"Error closing IMAGE mode hand landmarker: {e}")
+-        
+-        self.landmarker = None
+-        self.is_initialized = False
+-        
+-        # Handle exceptions gracefully
+-        if exc_type:
+-            print(f"Exception in IMAGE mode hand landmarker: {exc_type.__name__}: {exc_val}")
+-        
+-        return False  # Don't suppress exceptions
+-    
+-    def detect(self, rgb_frame):
+-        """Detect hands synchronously in the given RGB frame."""
+-        if not self.is_initialized or not self.landmarker:
+-            raise RuntimeError("IMAGE mode hand landmarker not initialized. Use within 'with' statement.")
+-        
+-        try:
+-            # Convert frame to MediaPipe format
+-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+-            
+-            # Perform synchronous detection
+-            detection_result = self.landmarker.detect(mp_image)
+-            return detection_result
+-            
+-        except Exception as e:
+-            print(f"Error during IMAGE mode hand detection: {e}")
+-            raise
+-    
+-    def is_ready(self):
+-        """Check if the landmarker is ready for detection."""
+-        return self.is_initialized and self.landmarker is not None
+\ No newline at end of file
++
++class HandLandmarkerManagerLive(HandLandmarkerManager):
++    """Live-stream landmarker (kept so existing call sites don't change)."""
++
++    def __init__(self, model_path=DEFAULT_MODEL_PATH, **kwargs):
++        super().__init__(mode=LIVE, model_path=model_path, **kwargs)
++
++
++class HandLandmarkerManagerImage(HandLandmarkerManager):
++    """Single-image landmarker (kept so existing call sites don't change)."""
++
++    def __init__(self, model_path=DEFAULT_MODEL_PATH, **kwargs):
++        super().__init__(mode=IMAGE, model_path=model_path, **kwargs)
+diff --git a/hand_tracker/ml/auto_encoder.py b/hand_tracker/ml/auto_encoder.py
+index a2de192..c3e4044 100644
+--- a/hand_tracker/ml/auto_encoder.py
++++ b/hand_tracker/ml/auto_encoder.py
+@@ -1,6 +1,11 @@
+-import torch 
++"""Autoencoder that learns to turn raw (noisy) hand features into their smoothed versions.
++
++Unfinished experiment: no dataset is wired in yet. X_raw and X_smooth are arrays of
++shape (n_samples, 6): raw features and the matching smoothed features.
++"""
++import torch
+ import torch.nn as nn
+-import torch.optim as optim
++
+ 
+ class Autoencoder(nn.Module):
+     def __init__(self):
+@@ -20,29 +25,39 @@ class Autoencoder(nn.Module):
+         z = self.encoder(x)
+         return self.decoder(z)
+ 
+-model = Autoencoder()
+-criterion = nn.MSELoss()
+-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+ 
+-X_raw_tensor = torch.tensor(X_raw, dtype=torch.float32)
+-X_smooth_tensor = torch.tensor(X_smooth, dtype=torch.float32)
++def train(X_raw, X_smooth, epochs=1000, lr=0.001):
++    """Train an Autoencoder to map X_raw onto X_smooth and return it."""
++    model = Autoencoder()
++    criterion = nn.MSELoss()
++    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
++
++    X_raw_tensor = torch.tensor(X_raw, dtype=torch.float32)
++    X_smooth_tensor = torch.tensor(X_smooth, dtype=torch.float32)
++
++    for epoch in range(epochs):
++        output = model(X_raw_tensor)
++        loss = criterion(output, X_smooth_tensor)
++
++        optimizer.zero_grad()
++        loss.backward()
++        optimizer.step()
+ 
+-for epoch in range(1000):
+-    output = model(X_raw_tensor)
+-    loss = criterion(output, X_smooth_tensor)
+-    
+-    optimizer.zero_grad()
+-    loss.backward()
+-    optimizer.step()
++        if epoch % 100 == 0:
++            print(f"Epoch {epoch}, Loss: {loss.item()}")
+ 
+-    if epoch % 100 == 0:
+-        print(f"Epoch {epoch}, Loss: {loss.item()}")
++    return model
++
++
++def correct(model, noisy_data):
++    """Run noisy features through a trained model and return the corrected values."""
++    with torch.no_grad():
++        return model(torch.tensor(noisy_data, dtype=torch.float32))
+ 
+-with torch.no_grad():
+-    corrected = model(torch.tensor(new_noisy_data, dtype=torch.float32))
+ 
+ def main():
+     print(torch.__version__)
+- 
++
++
+ if __name__ == "__main__":
+-    main()
+\ No newline at end of file
++    main()
+diff --git a/hand_tracker/overlay.py b/hand_tracker/overlay.py
+new file mode 100644
+index 0000000..f04d53e
+--- /dev/null
++++ b/hand_tracker/overlay.py
+@@ -0,0 +1,42 @@
++"""Draw detected hand landmarks over webcam frames."""
++import cv2 as cv
++import mediapipe as mp
++
++HAND_CONNECTIONS = mp.solutions.hands.HAND_CONNECTIONS
++
++
++def flip_horizontal(rgb_frame):
++    """Mirror the frame so it behaves like a mirror."""
++    return cv.flip(rgb_frame, 1)
++
++
++def draw_landmarks(rgb_frame, detection_result):
++    """Draw hand connections and numbered landmarks onto the frame (in place)."""
++    if not detection_result or not detection_result.hand_landmarks:
++        return rgb_frame
++
++    height, width, _ = rgb_frame.shape
++    for hand_landmarks in detection_result.hand_landmarks:
++        # Convert normalized coordinates to pixel coordinates
++        points = [(int(lm.x * width), int(lm.y * height)) for lm in hand_landmarks]
++
++        for start, end in HAND_CONNECTIONS:
++            cv.line(rgb_frame, points[start], points[end], (0, 255, 0), 2)
++
++        for idx, (x, y) in enumerate(points):
++            cv.circle(rgb_frame, (x, y), 5, (0, 0, 255), -1)
++            cv.putText(rgb_frame, str(idx), (x + 5, y - 5),
++                       cv.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
++
++    return rgb_frame
++
++
++def apply_transforms(bgr_frame, hand_manager):
++    """Mirror a webcam frame, send it for detection, and draw the latest landmarks on it."""
++    rgb_frame = cv.cvtColor(bgr_frame, cv.COLOR_BGR2RGB)
++    rgb_frame = flip_horizontal(rgb_frame)
++
++    hand_manager.detect_async(rgb_frame)
++    rgb_frame = draw_landmarks(rgb_frame, hand_manager.get_latest_result())
++
++    return cv.cvtColor(rgb_frame, cv.COLOR_RGB2BGR)
+diff --git a/hand_tracker/parser_model.py b/hand_tracker/parser_model.py
+deleted file mode 100644
+index 927ab13..0000000
+--- a/hand_tracker/parser_model.py
++++ /dev/null
+@@ -1,431 +0,0 @@
+-import numpy as np
+-import math
+-import cv2 as cv
+-from scipy.signal import savgol_filter
+-from .landmarker import HandLandmarkerManagerImage
+-import mediapipe as mp
+-import sys
+-from contextlib import redirect_stdout
+-
+-# Joint Angles
+-def calculate_joint_angle(p1, p2, p3):
+-    """Calculate angle at joint p2 between points p1-p2-p3"""
+-    # Convert to vectors
+-    v1 = np.array([p1.x - p2.x, p1.y - p2.y, p1.z - p2.z])
+-    v2 = np.array([p3.x - p2.x, p3.y - p2.y, p3.z - p2.z])
+-    
+-    # Calculate angle
+-    cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+-    angle = np.arccos(np.clip(cos_angle, -1.0, 1.0))
+-    return np.degrees(angle)
+-
+-def calculate_joint_angles(hand_landmarks):
+-    joint_angles = {}
+-
+-    # 1. FINGER JOINT ANGLES (Most Important)
+-    finger_joints = {
+-        'thumb': [2, 3, 4],         # MCP, IP, TIP
+-        'index': [5, 6, 7, 8],      # MCP, PIP, DIP, TIP  
+-        'middle': [9, 10, 11, 12],  # MCP, PIP, DIP, TIP
+-        'ring': [13, 14, 15, 16],   # MCP, PIP, DIP, TIP
+-        'pinky': [17, 18, 19, 20]   # MCP, PIP, DIP, TIP
+-    }
+-    
+-    # Calculate joint angles for each finger
+-    for finger_name, joints in finger_joints.items():
+-        finger_angles = []
+-        
+-        if finger_name == 'thumb':
+-            # Thumb: CMC-MCP-IP and MCP-IP-TIP angles
+-            cmc_mcp_ip = calculate_joint_angle(
+-                hand_landmarks[1], hand_landmarks[2], hand_landmarks[3])
+-            mcp_ip_tip = calculate_joint_angle(
+-                hand_landmarks[2], hand_landmarks[3], hand_landmarks[4])
+-            finger_angles = [cmc_mcp_ip, mcp_ip_tip]
+-        else:
+-            # Other fingers: MCP-PIP-DIP and PIP-DIP-TIP angles
+-            mcp_pip_dip = calculate_joint_angle(
+-                hand_landmarks[joints[0]], hand_landmarks[joints[1]], hand_landmarks[joints[2]])
+-            pip_dip_tip = calculate_joint_angle(
+-                hand_landmarks[joints[1]], hand_landmarks[joints[2]], hand_landmarks[joints[3]])
+-            finger_angles = [mcp_pip_dip, pip_dip_tip]
+-        
+-        joint_angles[f'{finger_name}_angles'] = finger_angles
+-
+-    return joint_angles
+-
+-# Finger Extension
+-def calculate_finger_extension(hand_landmarks):
+-    """Calculate finger extensions and return as dictionary."""
+-    wrist = hand_landmarks[0]
+-    finger_extensions = {}  # Create the dictionary
+-    
+-    fingertips = {'thumb': 4, 'index': 8, 'middle': 12, 'ring': 16, 'pinky': 20}
+-    for finger_name, tip_idx in fingertips.items():
+-        tip = hand_landmarks[tip_idx]
+-        extension = math.sqrt((tip.x - wrist.x)**2 + (tip.y - wrist.y)**2)
+-        finger_extensions[finger_name] = extension
+-    
+-    return finger_extensions  # Return the dictionary
+-    
+-# Finger Spread
+-def vector_angle(v1, v2):
+-    cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+-    return np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
+-
+-def calculate_finger_spread(hand_landmarks):
+-    wrist = hand_landmarks[0]
+-    # 3. FINGER SPREAD (Important for robotic hand positioning)
+-    spread = {}
+-    # Angle between adjacent fingers
+-    index_vec = np.array([hand_landmarks[8].x - wrist.x, hand_landmarks[8].y - wrist.y])
+-    middle_vec = np.array([hand_landmarks[12].x - wrist.x, hand_landmarks[12].y - wrist.y])
+-    ring_vec = np.array([hand_landmarks[16].x - wrist.x, hand_landmarks[16].y - wrist.y])
+-    pinky_vec = np.array([hand_landmarks[20].x - wrist.x, hand_landmarks[20].y - wrist.y])
+-    
+-    # Calculate spread angles
+-    spread['index_middle'] = vector_angle(index_vec, middle_vec)
+-    spread['middle_ring'] = vector_angle(middle_vec, ring_vec)
+-    spread['ring_pinky'] = vector_angle(ring_vec, pinky_vec)
+-
+-    return spread
+-    
+-# Thumb Opposition
+-def calculate_thumb_opposition(hand_landmarks):
+-    # 4. THUMB OPPOSITION (Critical for robotic grasping)
+-    thumb_tip = hand_landmarks[4]
+-    index_tip = hand_landmarks[8]
+-    return math.sqrt((thumb_tip.x - index_tip.x)**2 + (thumb_tip.y - index_tip.y)**2)
+-    
+-# Generate Data
+-def create_example_data(detection_result):
+-    """Extract features from detection result for right hand only."""
+-    if not detection_result or not detection_result.hand_landmarks:
+-        return None
+-    
+-    # Find the right hand
+-    for i, hand_landmarks in enumerate(detection_result.hand_landmarks):
+-        try:
+-            current_handedness = detection_result.handedness[i][0].category_name
+-            if current_handedness == "Right":
+-                features = {}
+-                features['joint_angles']      = calculate_joint_angles(hand_landmarks)
+-                features['finger_extensions'] = calculate_finger_extension(hand_landmarks)  # Fixed call
+-                features['finger_spread']     = calculate_finger_spread(hand_landmarks)
+-                features['thumb_opposition']  = calculate_thumb_opposition(hand_landmarks)
+-                return features
+-        except Exception as e:
+-            print(f"Error processing hand {i}: {e}")
+-            continue
+-    
+-    return None  # No right hand found
+-
+-# Label Data
+-# uses: savgol_filter(data, window_length, polyorder)
+-def label_joint_angles(data_list, window_length, polyorder):
+-    labelled_joint_angles = {
+-        'thumb_angles':  [[], []],
+-        'index_angles':  [[], []],
+-        'middle_angles': [[], []],
+-        'ring_angles':   [[], []],
+-        'pinky_angles':  [[], []]
+-    }
+-
+-    for data in data_list:
+-        print('label_joint_angles')
+-        labelled_joint_angles['thumb_angles' ][0].append(data['joint_angles']['thumb_angles' ][0])
+-        labelled_joint_angles['thumb_angles' ][1].append(data['joint_angles']['thumb_angles' ][1])
+-
+-        labelled_joint_angles['index_angles' ][0].append(data['joint_angles']['index_angles' ][0])
+-        labelled_joint_angles['index_angles' ][1].append(data['joint_angles']['index_angles' ][1])
+-
+-        labelled_joint_angles['middle_angles'][0].append(data['joint_angles']['middle_angles'][0])
+-        labelled_joint_angles['middle_angles'][1].append(data['joint_angles']['middle_angles'][1])
+-
+-        labelled_joint_angles['ring_angles'  ][0].append(data['joint_angles']['ring_angles'  ][0])
+-        labelled_joint_angles['ring_angles'  ][1].append(data['joint_angles']['ring_angles'  ][1])
+-
+-        labelled_joint_angles['pinky_angles' ][0].append(data['joint_angles']['pinky_angles' ][0])
+-        labelled_joint_angles['pinky_angles' ][1].append(data['joint_angles']['pinky_angles' ][1])
+-
+-    labelled_joint_angles['thumb_angles' ][0] = savgol_filter(labelled_joint_angles['thumb_angles' ][0], window_length, polyorder)
+-    labelled_joint_angles['thumb_angles' ][1] = savgol_filter(labelled_joint_angles['thumb_angles' ][1], window_length, polyorder)
+-    labelled_joint_angles['index_angles' ][0] = savgol_filter(labelled_joint_angles['index_angles' ][0], window_length, polyorder)
+-    labelled_joint_angles['index_angles' ][1] = savgol_filter(labelled_joint_angles['index_angles' ][1], window_length, polyorder)
+-    labelled_joint_angles['middle_angles'][0] = savgol_filter(labelled_joint_angles['middle_angles'][0], window_length, polyorder)
+-    labelled_joint_angles['middle_angles'][1] = savgol_filter(labelled_joint_angles['middle_angles'][1], window_length, polyorder)
+-    labelled_joint_angles['ring_angles'  ][0] = savgol_filter(labelled_joint_angles['ring_angles'  ][0], window_length, polyorder)
+-    labelled_joint_angles['ring_angles'  ][1] = savgol_filter(labelled_joint_angles['ring_angles'  ][1], window_length, polyorder)
+-    labelled_joint_angles['pinky_angles' ][0] = savgol_filter(labelled_joint_angles['pinky_angles' ][0], window_length, polyorder)
+-    labelled_joint_angles['pinky_angles' ][1] = savgol_filter(labelled_joint_angles['pinky_angles' ][1], window_length, polyorder)
+-
+-    return labelled_joint_angles
+-
+-def label_finger_extension(data_list, window_length, polyorder):
+-    labelled_finger_extensions = {
+-        'thumb_extensions':  [],
+-        'index_extensions':  [],
+-        'middle_extensions': [],
+-        'ring_extensions':   [],
+-        'pinky_extensions':  []
+-    }
+-
+-    for data in data_list:
+-        labelled_finger_extensions['thumb_extensions' ].append(data['finger_extensions']['thumb'])
+-        labelled_finger_extensions['index_extensions' ].append(data['finger_extensions']['index'])
+-        labelled_finger_extensions['middle_extensions'].append(data['finger_extensions']['middle'])
+-        labelled_finger_extensions['ring_extensions'  ].append(data['finger_extensions']['ring'])
+-        labelled_finger_extensions['pinky_extensions' ].append(data['finger_extensions']['pinky'])
+-
+-    labelled_finger_extensions['thumb_extensions' ] = savgol_filter(labelled_finger_extensions['thumb_extensions' ], window_length, polyorder)
+-    labelled_finger_extensions['index_extensions' ] = savgol_filter(labelled_finger_extensions['index_extensions' ], window_length, polyorder)
+-    labelled_finger_extensions['middle_extensions'] = savgol_filter(labelled_finger_extensions['middle_extensions'], window_length, polyorder)
+-    labelled_finger_extensions['ring_extensions'  ] = savgol_filter(labelled_finger_extensions['ring_extensions'  ], window_length, polyorder)
+-    labelled_finger_extensions['pinky_extensions' ] = savgol_filter(labelled_finger_extensions['pinky_extensions' ], window_length, polyorder)
+-
+-    return labelled_finger_extensions
+-
+-def label_finger_spread(data_list, window_length, polyorder):
+-    labelled_finger_spread = {
+-        'index_middle_spread':  [],
+-        'middle_ring_spread':   [],
+-        'ring_pinky_spread'    : []
+-    }
+-
+-    for data in data_list:
+-        labelled_finger_spread['index_middle_spread'].append(data['finger_spread']['index_middle'])
+-        labelled_finger_spread['middle_ring_spread' ].append(data['finger_spread']['middle_ring'])
+-        labelled_finger_spread['ring_pinky_spread'  ].append(data['finger_spread']['ring_pinky'])
+-
+-    labelled_finger_spread['index_middle_spread'] = savgol_filter(labelled_finger_spread['index_middle_spread'], window_length, polyorder)
+-    labelled_finger_spread['middle_ring_spread' ] = savgol_filter(labelled_finger_spread['middle_ring_spread' ], window_length, polyorder)
+-    labelled_finger_spread['ring_pinky_spread'  ] = savgol_filter(labelled_finger_spread['ring_pinky_spread'  ], window_length, polyorder)
+-
+-    return labelled_finger_spread
+-
+-def label_thumb_opposition(data_list, window_length, polyorder):
+-    labelled_thumb_opposition = []
+-
+-    for data in data_list:
+-        labelled_thumb_opposition.append(data['thumb_opposition'])
+-
+-    labelled_thumb_opposition = savgol_filter(labelled_thumb_opposition, window_length, polyorder)
+-
+-    return labelled_thumb_opposition
+-
+-def create_labelled_example(example_features_list):
+-    # Adjust window_length based on available data
+-    data_length = len(example_features_list)
+-    
+-    # Window length must be odd and <= data length
+-    if data_length >= 5:
+-        window_length = 5
+-    elif data_length >= 3:
+-        window_length = 3
+-    else:
+-        # Not enough data for smoothing, just return the raw data
+-        print(f"Warning: Only {data_length} frames, skipping smoothing")
+-        return {
+-            'joint_angles': example_features_list[0]['joint_angles'] if data_length > 0 else {},
+-            'finger_extensions': example_features_list[0]['finger_extensions'] if data_length > 0 else {},
+-            'finger_spread': example_features_list[0]['finger_spread'] if data_length > 0 else {},
+-            'thumb_opposition': example_features_list[0]['thumb_opposition'] if data_length > 0 else 0
+-        }
+-    
+-    polyorder = min(2, window_length - 1)  # polyorder must be < window_length
+-
+-    print(f"Using window_length={window_length}, polyorder={polyorder} for {data_length} frames")
+-
+-    # Create labelled data with proper error handling
+-    labelled_data = {}
+-    labelled_data['joint_angles']      = label_joint_angles(example_features_list, window_length, polyorder)
+-    labelled_data['finger_extensions'] = label_finger_extension(example_features_list, window_length, polyorder)
+-    labelled_data['finger_spread']     = label_finger_spread(example_features_list, window_length, polyorder)
+-    labelled_data['thumb_opposition']  = label_thumb_opposition(example_features_list, window_length, polyorder)
+-
+-    return labelled_data
+-
+-# print Data
+-def print_example_data(example_features, file=None):
+-    """Print example features data - with null check."""
+-    if example_features is None:
+-        print("No features to display (example_features is None)", file=file)
+-        return
+-    
+-    # Joint angles (most important for servos)
+-    print("\nJOINT ANGLES (for servo control):", file=file)
+-    if 'joint_angles' in example_features:
+-        joint_angles = example_features['joint_angles']
+-        for finger, angles in joint_angles.items():
+-            if finger.endswith('_angles'):
+-                finger_name = finger.replace('_angles', '').upper()
+-                # Check if angles is a list of numbersr
+-                try:
+-                    formatted_angles = [f'{float(a):.1f}' for a in angles]
+-                    print(f"  {finger_name:<8}: {formatted_angles}", file=file)
+-                except (TypeError, ValueError):
+-                    print(f"  {finger_name:<8}: {angles} (invalid data)", file=file)
+-    
+-    # Check if required keys exist
+-    if 'finger_extensions' not in example_features:
+-        print("ERROR: 'finger_extensions' key missing", file=file)
+-        return
+-    
+-    # Finger extensions (for grip strength)
+-    print("\nFINGER EXTENSIONS:", file=file)
+-    for finger, ext in example_features['finger_extensions'].items():
+-        try:
+-            print(f"  {finger.capitalize():<8}: {float(ext):.3f}", file=file)
+-        except (TypeError, ValueError):
+-            print(f"  {finger.capitalize():<8}: {ext} (invalid data)", file=file)
+-    
+-    # Check if finger_spread exists
+-    if 'finger_spread' not in example_features:
+-        print("ERROR: 'finger_spread' key missing", file=file)
+-        return
+-    
+-    # Finger spread (for object grasping)
+-    print("\nFINGER SPREAD:", file=file)
+-    for spread, angle in example_features['finger_spread'].items():
+-        try:
+-            print(f"  {spread:<15}: {float(angle):.1f}", file=file)
+-        except (TypeError, ValueError):
+-            print(f"  {spread:<15}: {angle} (invalid data)", file=file)
+-    
+-    # Check thumb_opposition
+-    if 'thumb_opposition' not in example_features:
+-        print("ERROR: 'thumb_opposition' key missing", file=file)
+-        return
+-    
+-    # Thumb opposition (for precision grip)
+-    try:
+-        thumb_opp = float(example_features['thumb_opposition'])
+-        print(f"\nTHUMB OPPOSITION: {thumb_opp:.3f}", file=file)
+-    except (TypeError, ValueError):
+-        print(f"\nTHUMB OPPOSITION: {example_features['thumb_opposition']} (invalid data)", file=file)
+-
+-# Fix the print_labelled_data function with proper type checking
+-def print_labelled_data(labelled_features):
+-    if labelled_features is None:
+-        print("No labelled features to display")
+-        return
+-    
+-    # Print Joint Angles
+-    print("\nLABELLED JOINT ANGLES (smoothed):")
+-    if 'joint_angles' in labelled_features:
+-        joint_angles = labelled_features['joint_angles']
+-        for finger in ['thumb_angles', 'index_angles', 'middle_angles', 'ring_angles', 'pinky_angles']:
+-            if finger in joint_angles:
+-                angles = joint_angles[finger]
+-                finger_name = finger.replace('_angles', '').upper()
+-                angle_strs = []
+-                for i, angle_series in enumerate(angles):
+-                    try:
+-                        if hasattr(angle_series, '__iter__'):  # Check if it's iterable
+-                            formatted_series = [f'{float(a):.1f}' for a in angle_series]
+-                            angle_strs.append(f"{formatted_series}")
+-                        else:
+-                            angle_strs.append(f"{float(angle_series):.1f}")
+-                    except (TypeError, ValueError):
+-                        angle_strs.append(f"{angle_series} (invalid)")
+-                print(f"  {finger_name:<8}: {angle_strs}")
+-
+-    # Print Finger Extensions
+-    print("\nLABELLED FINGER EXTENSIONS (smoothed):")
+-    if 'finger_extensions' in labelled_features:
+-        finger_ext = labelled_features['finger_extensions']
+-        for finger in ['thumb_extensions', 'index_extensions', 'middle_extensions', 'ring_extensions', 'pinky_extensions']:
+-            if finger in finger_ext:
+-                ext_series = finger_ext[finger]
+-                finger_name = finger.replace('_extensions', '').capitalize()
+-                try:
+-                    if hasattr(ext_series, '__iter__'):
+-                        formatted_ext = [f'{float(e):.3f}' for e in ext_series]
+-                        print(f"  {finger_name:<8}: {formatted_ext}")
+-                    else:
+-                        print(f"  {finger_name:<8}: {float(ext_series):.3f}")
+-                except (TypeError, ValueError):
+-                    print(f"  {finger_name:<8}: {ext_series} (invalid)")
+-
+-    # Print Finger Spread
+-    print("\nLABELLED FINGER SPREAD (smoothed):")
+-    if 'finger_spread' in labelled_features:
+-        finger_spread = labelled_features['finger_spread']
+-        for spread in ['index_middle_spread', 'middle_ring_spread', 'ring_pinky_spread']:
+-            if spread in finger_spread:
+-                spread_series = finger_spread[spread]
+-                try:
+-                    if hasattr(spread_series, '__iter__'):
+-                        formatted_spread = [f'{float(a):.1f}' for a in spread_series]
+-                        print(f"  {spread:<20}: {formatted_spread}")
+-                    else:
+-                        print(f"  {spread:<20}: {float(spread_series):.1f}")
+-                except (TypeError, ValueError):
+-                    print(f"  {spread:<20}: {spread_series} (invalid)")
+-
+-    # Print Thumb Opposition
+-    print("\nLABELLED THUMB OPPOSITION (smoothed):")
+-    if 'thumb_opposition' in labelled_features:
+-        thumb_opp = labelled_features['thumb_opposition']
+-        try:
+-            if hasattr(thumb_opp, '__iter__'):
+-                formatted_thumb = [f'{float(t):.3f}' for t in thumb_opp]
+-                print(f"  Thumb Opposition: {formatted_thumb}")
+-            else:
+-                print(f"  Thumb Opposition: {float(thumb_opp):.3f}")
+-        except (TypeError, ValueError):
+-            print(f"  Thumb Opposition: {thumb_opp} (invalid)")
+-
+-# Fix the generate_labelled_data function with proper error handling
+-def generate_labelled_data(bgr_frame_list):
+-    feature_list = []
+-    example_list = []
+-    labelled_data = None
+-
+-    with open('output.txt', 'w') as f:
+-        with redirect_stdout(f):
+-            try:
+-                with HandLandmarkerManagerImage() as image_hand_manager:
+-                    print(f"Processing {len(bgr_frame_list)} frames...")
+-
+-                    # Process each frame
+-                    for i, bgr_frame in enumerate(bgr_frame_list):
+-                        print(f"Processing frame {i+1}/{len(bgr_frame_list)}")
+-                        try:
+-                            rgb_frame = cv.cvtColor(bgr_frame, cv.COLOR_BGR2RGB)
+-                            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+-                            detection_result = image_hand_manager.landmarker.detect(mp_image)
+-                            feature_list.append(detection_result)
+-                        except Exception as e:
+-                            print(f"Error processing frame {i+1}: {e}")
+-                            feature_list.append(None)
+-
+-                    # Extract features from detection results
+-                    for i, detection_result in enumerate(feature_list):
+-                        print(f"Extracting features from frame {i+1}")
+-                        if detection_result is not None:
+-                            example = create_example_data(detection_result)
+-                            if example is not None:  # Only process valid examples
+-                                print_example_data(example)
+-                                example_list.append(example)
+-                            else:
+-                                print(f"No right hand detected in frame {i+1}")
+-                        else:
+-                            print(f"Frame {i+1} processing failed")
+-
+-                    # Create labelled data only if we have valid examples
+-                    if len(example_list) > 0:
+-                        print(f"\nCreating labelled data from {len(example_list)} valid frames...")
+-                        labelled_data = create_labelled_example(example_list)
+-                        if labelled_data:
+-                            print_labelled_data(labelled_data)
+-                    else:
+-                        print("No valid hand data found in any frames")
+-                        
+-            except Exception as e:
+-                print(f"Error in generate_labelled_data: {e}")
+-                
+-    print("Labelled data generation complete. Check output.txt for details.")
+-    return labelled_data
+-
+-
+diff --git a/hand_tracker/report.py b/hand_tracker/report.py
+new file mode 100644
+index 0000000..39ecaaf
+--- /dev/null
++++ b/hand_tracker/report.py
+@@ -0,0 +1,55 @@
++"""Plain-text reports of per-frame and smoothed features."""
++from .features import FINGERS, SPREAD_NAMES
++
++
++def print_example_data(example_features, file=None):
++    """Print one frame's features."""
++    if example_features is None:
++        print("No features to display (example_features is None)", file=file)
++        return
++
++    # Joint angles (most important for servos)
++    print("\nJOINT ANGLES (for servo control):", file=file)
++    for finger, angles in example_features['joint_angles'].items():
++        name = finger.replace('_angles', '').upper()
++        print(f"  {name:<8}: {[f'{float(a):.1f}' for a in angles]}", file=file)
++
++    # Finger extensions (for grip strength)
++    print("\nFINGER EXTENSIONS:", file=file)
++    for finger, extension in example_features['finger_extensions'].items():
++        print(f"  {finger.capitalize():<8}: {float(extension):.3f}", file=file)
++
++    # Finger spread (for object grasping)
++    print("\nFINGER SPREAD:", file=file)
++    for spread, angle in example_features['finger_spread'].items():
++        print(f"  {spread:<15}: {float(angle):.1f}", file=file)
++
++    # Thumb opposition (for precision grip)
++    print(f"\nTHUMB OPPOSITION: {float(example_features['thumb_opposition']):.3f}", file=file)
++
++
++def print_labelled_data(labelled_features):
++    """Print smoothed features: one list of values per measurement, one value per frame."""
++    if labelled_features is None:
++        print("No labelled features to display")
++        return
++
++    print("\nLABELLED JOINT ANGLES (smoothed):")
++    for finger in FINGERS:
++        series_per_joint = labelled_features['joint_angles'][f"{finger}_angles"]
++        joints = [str([f"{float(a):.1f}" for a in series]) for series in series_per_joint]
++        print(f"  {finger.upper():<8}: {joints}")
++
++    print("\nLABELLED FINGER EXTENSIONS (smoothed):")
++    for finger in FINGERS:
++        series = labelled_features['finger_extensions'][f"{finger}_extensions"]
++        print(f"  {finger.capitalize():<8}: {[f'{float(e):.3f}' for e in series]}")
++
++    print("\nLABELLED FINGER SPREAD (smoothed):")
++    for name in SPREAD_NAMES:
++        series = labelled_features['finger_spread'][f"{name}_spread"]
++        print(f"  {name + '_spread':<20}: {[f'{float(a):.1f}' for a in series]}")
++
++    print("\nLABELLED THUMB OPPOSITION (smoothed):")
++    series = labelled_features['thumb_opposition']
++    print(f"  Thumb Opposition: {[f'{float(t):.3f}' for t in series]}")
+diff --git a/hand_tracker/smoothing.py b/hand_tracker/smoothing.py
+new file mode 100644
+index 0000000..7a03974
+--- /dev/null
++++ b/hand_tracker/smoothing.py
+@@ -0,0 +1,72 @@
++"""Smooth per-frame features over a short clip (Savitzky-Golay filter)."""
++import numpy as np
++from scipy.signal import savgol_filter
++
++from .features import FINGERS, SPREAD_NAMES
++
++
++def _smooth(values, window_length, polyorder):
++    """Savitzky-Golay smoothing. With window_length=None the values pass through unchanged."""
++    if window_length is None:
++        return np.asarray(values, dtype=float)
++    return savgol_filter(values, window_length, polyorder)
++
++
++def label_joint_angles(data_list, window_length, polyorder):
++    labelled = {}
++    for finger in FINGERS:
++        key = f"{finger}_angles"
++        # One time series per joint: [joint 1 over frames, joint 2 over frames]
++        per_joint = zip(*(data['joint_angles'][key] for data in data_list))
++        labelled[key] = [_smooth(list(series), window_length, polyorder) for series in per_joint]
++    return labelled
++
++
++def label_finger_extension(data_list, window_length, polyorder):
++    return {
++        f"{finger}_extensions": _smooth(
++            [data['finger_extensions'][finger] for data in data_list], window_length, polyorder)
++        for finger in FINGERS
++    }
++
++
++def label_finger_spread(data_list, window_length, polyorder):
++    return {
++        f"{name}_spread": _smooth(
++            [data['finger_spread'][name] for data in data_list], window_length, polyorder)
++        for name in SPREAD_NAMES
++    }
++
++
++def label_thumb_opposition(data_list, window_length, polyorder):
++    return _smooth([data['thumb_opposition'] for data in data_list], window_length, polyorder)
++
++
++def create_labelled_example(example_features_list):
++    """Smooth a list of per-frame feature dicts into one dict of time series.
++
++    The window is 5 frames (or 3 for 3-4 frames). With fewer than 3 frames there is
++    nothing to smooth, so the raw values come back in the same shape.
++    """
++    data_length = len(example_features_list)
++
++    # Window length must be odd and <= data length
++    if data_length >= 5:
++        window_length = 5
++    elif data_length >= 3:
++        window_length = 3
++    else:
++        print(f"Warning: Only {data_length} frames, skipping smoothing")
++        window_length = None
++
++    polyorder = None
++    if window_length is not None:
++        polyorder = min(2, window_length - 1)  # polyorder must be < window_length
++        print(f"Using window_length={window_length}, polyorder={polyorder} for {data_length} frames")
++
++    return {
++        'joint_angles':      label_joint_angles(example_features_list, window_length, polyorder),
++        'finger_extensions': label_finger_extension(example_features_list, window_length, polyorder),
++        'finger_spread':     label_finger_spread(example_features_list, window_length, polyorder),
++        'thumb_opposition':  label_thumb_opposition(example_features_list, window_length, polyorder),
++    }

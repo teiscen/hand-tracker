@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hand-tracker"
+version = "0.1.0"
+description = "Webcam hand tracking with MediaPipe: joint angles and finger features for a robotic hand."
+readme = "README.md"
+requires-python = ">=3.9,<3.13"
+dependencies = [
+    "mediapipe==0.10.21",
+    "opencv-contrib-python==4.11.0.86",
+    "numpy==1.26.4",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+ml = ["torch"]
+dev = ["pytest"]
+
+[project.scripts]
+hand-tracker = "hand_tracker.app:main"
+
+[tool.setuptools.packages.find]
+include = ["hand_tracker*"]
+
+[tool.setuptools.package-data]
+hand_tracker = ["models/*.task", "ros/urdf/*.xacro"]

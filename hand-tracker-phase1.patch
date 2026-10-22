@@ -1,0 +1,284 @@
+diff --git a/.gitignore b/.gitignore
+index 3549e8b..fe22d99 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,4 +1,8 @@
+ handenv/
++.venv/
+ OldParsers/
+ _hand.py
+ output.txt
++__pycache__/
++*.egg-info/
++runs/
+diff --git a/README.md b/README.md
+index e148275..25adb42 100644
+--- a/README.md
++++ b/README.md
+@@ -1,2 +1,60 @@
+ # Hand Tracker
+-Project for my AI class (SFU Cmpt 310).  
++
++Real-time hand tracking from a webcam using MediaPipe and OpenCV. It extracts finger joint angles, extension, spread and thumb opposition, the inputs for driving a robotic hand. Project for SFU CMPT 310.
++
++## Install
++
++Needs a webcam and Python 3.9 to 3.12 (tested on 3.12).
++
++```bash
++python -m venv .venv
++source .venv/bin/activate        # Windows: .venv\Scripts\activate
++pip install -e .
++```
++
++## Run
++
++```bash
++hand-tracker                     # or: python -m hand_tracker
++hand-tracker --camera 1          # pick a different camera
++hand-tracker --help
++```
++
++| Key | Action |
++|-----|--------|
++| `q` | Quit |
++| `r` | Capture 4 frames, smooth them, and write the features to `output.txt` in the current folder |
++
++Only the right hand is used for features.
++
++## How it works
++
++```
++Camera -> OpenCV (mirror, overlay) -> MediaPipe Hand Landmarker (21 points per hand)
++       -> features (joint angles, extension, spread, thumb opposition)
++       -> Savitzky-Golay smoothing -> [planned: model] -> ROS 2 / Gazebo
++```
++
++The pipeline diagram is in `Extraneous/Pipeline.png`.
++
++## Project layout
++
++| Path | What it is |
++|------|------------|
++| `hand_tracker/app.py` | Webcam loop and the `hand-tracker` command |
++| `hand_tracker/landmarker.py` | MediaPipe wrappers (live stream and single image) |
++| `hand_tracker/parser_model.py` | Feature extraction and smoothing |
++| `hand_tracker/models/` | The MediaPipe `hand_landmarker.task` model |
++| `hand_tracker/ros/` | Optional ROS 2 publisher and the robot hand URDF |
++| `hand_tracker/ml/` | Optional autoencoder experiment |
++| `Extraneous/` | Reports, diagrams and notes |
++
++## Optional parts
++
++**ROS 2.** `hand_tracker/ros/robot_controller.py` needs `rclpy` from your ROS 2 install (it is not on pip). Source ROS 2, then run `python -m hand_tracker.ros.robot_controller`. For now it publishes fixed example joint angles, not live tracking data.
++
++**Machine learning.** `pip install -e ".[ml]"` adds PyTorch. `hand_tracker/ml/auto_encoder.py` is an unfinished experiment and does not run yet.
++
++## Status
++
++Cleanup in progress. Planned next: tests for the feature math, a separate window for live data and test results, and replacing `output.txt` with saved recordings.
+diff --git a/hand_tracker/__init__.py b/hand_tracker/__init__.py
+new file mode 100644
+index 0000000..960d40d
+--- /dev/null
++++ b/hand_tracker/__init__.py
+@@ -0,0 +1,3 @@
++"""Webcam hand tracking with MediaPipe: joint angles and finger features."""
++
++__version__ = "0.1.0"
+diff --git a/hand_tracker/__main__.py b/hand_tracker/__main__.py
+new file mode 100644
+index 0000000..37c2a2d
+--- /dev/null
++++ b/hand_tracker/__main__.py
+@@ -0,0 +1,4 @@
++from .app import main
++
++if __name__ == "__main__":
++    main()
+diff --git a/Code/opencv.py b/hand_tracker/app.py
+similarity index 85%
+rename from Code/opencv.py
+rename to hand_tracker/app.py
+index 327312f..b6372d7 100644
+--- a/Code/opencv.py
++++ b/hand_tracker/app.py
+@@ -1,7 +1,9 @@
++import argparse
++
+ import mediapipe as mp
+ import cv2 as cv
+-from hand_landmarker import HandLandmarkerManagerLive
+-from parser_model import generate_labelled_data
++from .landmarker import HandLandmarkerManagerLive
++from .parser_model import generate_labelled_data
+ 
+ class Transforms:
+     def apply_transforms(bgr_frame, hand_manager):
+@@ -144,10 +146,21 @@ def webcam_loop(webcam_manager, hand_manager):
+ 
+     return True  # Continue the loop
+ 
+-def main():
+-    """Main function using context manager for webcam."""
++def main(argv=None):
++    """Entry point for the `hand-tracker` command."""
++    parser = argparse.ArgumentParser(
++        prog="hand-tracker",
++        description="Live hand tracking from a webcam. "
++                    "Press 'q' to quit, 'r' to capture 4 frames and write output.txt.")
++    parser.add_argument("--camera", type=int, default=0, help="camera index (default: 0)")
++    parser.add_argument("--width", type=int, default=640, help="capture width (default: 640)")
++    parser.add_argument("--height", type=int, default=480, help="capture height (default: 480)")
++    parser.add_argument("--fps", type=int, default=30, help="capture fps (default: 30)")
++    args = parser.parse_args(argv)
++
+     try:
+-        with WebcamManager(camera_id=0, width=640, height=480, fps=30) as webcam:
++        with WebcamManager(camera_id=args.camera, width=args.width,
++                           height=args.height, fps=args.fps) as webcam:
+             with HandLandmarkerManagerLive() as hand_manager:
+                 print("Starting webcam feed. Press 'q' to quit.")
+ 
+diff --git a/Code/hand_landmarker.py b/hand_tracker/landmarker.py
+similarity index 95%
+rename from Code/hand_landmarker.py
+rename to hand_tracker/landmarker.py
+index c1e39d2..0881236 100644
+--- a/Code/hand_landmarker.py
++++ b/hand_tracker/landmarker.py
+@@ -1,5 +1,10 @@
+-import mediapipe as mp
+ import time
++from pathlib import Path
++
++import mediapipe as mp
++
++# The model ships inside the package, so it is found no matter where you run from.
++DEFAULT_MODEL_PATH = Path(__file__).parent / "models" / "hand_landmarker.task"
+ 
+ # MediaPipe setup
+ BaseOptions = mp.tasks.BaseOptions
+@@ -12,13 +17,13 @@ class HandLandmarkerManagerLive:
+     """RAII context manager for MediaPipe hand landmark detection."""
+     
+     def __init__(self, 
+-                 model_path='hand_landmarker.task',
++                 model_path=DEFAULT_MODEL_PATH,
+                  num_hands=2,
+                  min_detection_confidence=0.5,
+                  min_presence_confidence=0.5,
+                  min_tracking_confidence=0.5):
+         """Initialize hand landmarker configuration."""
+-        self.model_path = model_path
++        self.model_path = str(model_path)
+         self.num_hands = num_hands
+         self.min_detection_confidence = min_detection_confidence
+         self.min_presence_confidence = min_presence_confidence
+@@ -127,13 +132,13 @@ class HandLandmarkerManagerImage:
+     """RAII context manager for MediaPipe hand detection in IMAGE mode (batch processing)."""
+     
+     def __init__(self, 
+-                 model_path='hand_landmarker.task',
++                 model_path=DEFAULT_MODEL_PATH,
+                  num_hands=2,
+                  min_detection_confidence=0.5,
+                  min_presence_confidence=0.5,
+                  min_tracking_confidence=0.5):
+         """Initialize hand landmarker configuration for IMAGE mode."""
+-        self.model_path = model_path
++        self.model_path = str(model_path)
+         self.num_hands = num_hands
+         self.min_detection_confidence = min_detection_confidence
+         self.min_presence_confidence = min_presence_confidence
+diff --git a/hand_tracker/ml/__init__.py b/hand_tracker/ml/__init__.py
+new file mode 100644
+index 0000000..15b663b
+--- /dev/null
++++ b/hand_tracker/ml/__init__.py
+@@ -0,0 +1 @@
++"""Optional ML experiments. Install with: pip install -e ".[ml]"."""
+diff --git a/Code/auto_encoder.py b/hand_tracker/ml/auto_encoder.py
+similarity index 100%
+rename from Code/auto_encoder.py
+rename to hand_tracker/ml/auto_encoder.py
+diff --git a/Code/hand_landmarker.task b/hand_tracker/models/hand_landmarker.task
+similarity index 100%
+rename from Code/hand_landmarker.task
+rename to hand_tracker/models/hand_landmarker.task
+diff --git a/Code/parser_model.py b/hand_tracker/parser_model.py
+similarity index 99%
+rename from Code/parser_model.py
+rename to hand_tracker/parser_model.py
+index 41b2833..927ab13 100644
+--- a/Code/parser_model.py
++++ b/hand_tracker/parser_model.py
+@@ -2,7 +2,7 @@ import numpy as np
+ import math
+ import cv2 as cv
+ from scipy.signal import savgol_filter
+-from hand_landmarker import HandLandmarkerManagerImage
++from .landmarker import HandLandmarkerManagerImage
+ import mediapipe as mp
+ import sys
+ from contextlib import redirect_stdout
+diff --git a/hand_tracker/ros/__init__.py b/hand_tracker/ros/__init__.py
+new file mode 100644
+index 0000000..f8454bb
+--- /dev/null
++++ b/hand_tracker/ros/__init__.py
+@@ -0,0 +1 @@
++"""Optional ROS 2 integration. Needs rclpy from your ROS 2 install (not pip)."""
+diff --git a/Code/robot_controller.py b/hand_tracker/ros/robot_controller.py
+similarity index 100%
+rename from Code/robot_controller.py
+rename to hand_tracker/ros/robot_controller.py
+diff --git a/Code/Hand Urdf/BionicHand.xacro b/hand_tracker/ros/urdf/BionicHand.xacro
+similarity index 100%
+rename from Code/Hand Urdf/BionicHand.xacro
+rename to hand_tracker/ros/urdf/BionicHand.xacro
+diff --git a/pyproject.toml b/pyproject.toml
+new file mode 100644
+index 0000000..3e036e5
+--- /dev/null
++++ b/pyproject.toml
+@@ -0,0 +1,29 @@
++[build-system]
++requires = ["setuptools>=68"]
++build-backend = "setuptools.build_meta"
++
++[project]
++name = "hand-tracker"
++version = "0.1.0"
++description = "Webcam hand tracking with MediaPipe: joint angles and finger features for a robotic hand."
++readme = "README.md"
++requires-python = ">=3.9,<3.13"
++dependencies = [
++    "mediapipe==0.10.21",
++    "opencv-contrib-python==4.11.0.86",
++    "numpy==1.26.4",
++    "scipy>=1.10",
++]
++
++[project.optional-dependencies]
++ml = ["torch"]
++dev = ["pytest"]
++
++[project.scripts]
++hand-tracker = "hand_tracker.app:main"
++
++[tool.setuptools.packages.find]
++include = ["hand_tracker*"]
++
++[tool.setuptools.package-data]
++hand_tracker = ["models/*.task", "ros/urdf/*.xacro"]
+diff --git a/requirements.txt b/requirements.txt
+index 233adaf..b3c093d 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,3 +1,2 @@
+-mediapipe==0.10.21
+-opencv-contrib-python==4.11.0.86
+-numpy==1.26.4
++# Dependencies are declared in pyproject.toml; this file just installs the project.
++-e .
