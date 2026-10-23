@@ -77,7 +77,7 @@
       <geometry>
         <box size="0.18 0.125 0.02"/> 
       </geometry>
-      <material>
+      <material name="color_orange">
         <color rgba="1 0.5 0 1"/>
       </material>
     </visual>

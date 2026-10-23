@@ -2,3 +2,39 @@ handenv/
 OldParsers/
 _hand.py
 output.txt
+
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.venv/
+venv/
+
+# MediaPipe / model artifacts
+*.task
+*.tflite
+*.pb
+
+# Output / logs
+output.txt
+*.log
+
+# RViz / ROS local caches
+.rviz_backup
+*.rviz~
+
+# Docker
+.docker/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
